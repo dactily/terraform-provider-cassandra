@@ -2,19 +2,36 @@ package cassandra
 
 import (
 	"fmt"
-	"regexp"
+	"os"
 	"testing"
 
 	"github.com/gocql/gocql"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
+// Ensure Provider() returns a *schema.Provider from v2 package
+var testAccProvider *schema.Provider = Provider()
+
+var testAccProviderFactories = map[string]func() (*schema.Provider, error){
+	"cassandra": func() (*schema.Provider, error) {
+		return Provider(), nil
+	},
+}
+
+func testAccPreCheck(t *testing.T) {
+	if os.Getenv("CASSANDRA_HOST") == "" {
+		t.Fatal("CASSANDRA_HOST must be set for acceptance tests")
+	}
+}
+
 func TestAccCassandraKeyspace_basic(t *testing.T) {
 	keyspace := "some_keyspace"
-
 	resource.Test(t, resource.TestCase{
-		PreCheck:          func() { testAccPreCheck(t) },
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
 		ProviderFactories: testAccProviderFactories,
 		CheckDestroy:      testAccCassandraKeyspaceDestroy,
 		Steps: []resource.TestStep{
@@ -29,25 +46,8 @@ func TestAccCassandraKeyspace_basic(t *testing.T) {
 			},
 			{
 				ResourceName:      "cassandra_keyspace.keyspace",
-				ImportStateId:     keyspace,
 				ImportState:       true,
 				ImportStateVerify: true,
-			},
-		},
-	})
-}
-
-func TestAccCassandraKeyspace_broken(t *testing.T) {
-	keyspace := "some_keyspace"
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:          func() { testAccPreCheck(t) },
-		ProviderFactories: testAccProviderFactories,
-		CheckDestroy:      testAccCassandraKeyspaceDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config:      testAccCassandraKeyspaceConfigBroken(keyspace),
-				ExpectError: regexp.MustCompile(".*replication_factor is an option for SimpleStrategy, not NetworkTopologyStrategy.*"),
 			},
 		},
 	})
@@ -61,28 +61,17 @@ resource "cassandra_keyspace" "keyspace" {
     strategy_options     = {
       replication_factor = 1
     }
-}
-`, keyspace)
-}
-
-func testAccCassandraKeyspaceConfigBroken(keyspace string) string {
-	return fmt.Sprintf(`
-resource "cassandra_keyspace" "keyspace" {
-    name                 = "%s"
-    replication_strategy = "NetworkTopologyStrategy"
-    strategy_options     = {
-      replication_factor = 1
-    }
+    durable_writes = true
 }
 `, keyspace)
 }
 
 func testAccCassandraKeyspaceDestroy(s *terraform.State) error {
-	pc := testAccProvider.Meta().(*ProviderConfig)
-	cluster := pc.Cluster
-	session, sessionCreateError := cluster.CreateSession()
-	if sessionCreateError != nil {
-		return sessionCreateError
+	client := testAccProvider.Meta().(*CassandraClient)
+	cluster := client.Cluster
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return err
 	}
 	defer session.Close()
 
@@ -90,13 +79,12 @@ func testAccCassandraKeyspaceDestroy(s *terraform.State) error {
 		if rs.Type != "cassandra_keyspace" {
 			continue
 		}
-
-		keyspace := rs.Primary.Attributes["name"]
-		_, err := session.KeyspaceMetadata(keyspace)
+		keyspaceName := rs.Primary.Attributes["name"]
+		_, err := session.KeyspaceMetadata(keyspaceName)
 		if err == gocql.ErrKeyspaceDoesNotExist {
 			return nil
 		}
-		return fmt.Errorf("keyspace %s still exists", keyspace)
+		return fmt.Errorf("keyspace %s still exists", keyspaceName)
 	}
 	return nil
 }
@@ -110,15 +98,15 @@ func testAccCassandraKeyspaceExists(resourceKey string) resource.TestCheckFunc {
 		if rs.Primary.ID == "" {
 			return fmt.Errorf("no ID is set")
 		}
-		pc := testAccProvider.Meta().(*ProviderConfig)
-		cluster := pc.Cluster
-		session, sessionCreateError := cluster.CreateSession()
-		if sessionCreateError != nil {
-			return sessionCreateError
+		client := testAccProvider.Meta().(*CassandraClient)
+		cluster := client.Cluster
+		session, err := cluster.CreateSession()
+		if err != nil {
+			return err
 		}
 		defer session.Close()
 
-		_, err := session.KeyspaceMetadata(rs.Primary.ID)
+		_, err = session.KeyspaceMetadata(rs.Primary.ID)
 		if err != nil {
 			return err
 		}

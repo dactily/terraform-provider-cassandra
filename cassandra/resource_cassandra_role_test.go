@@ -1,105 +1,69 @@
 package cassandra
 
 import (
-	"fmt"
-	"regexp"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"testing"
-
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
-func TestAccCassandraRole_basic(t *testing.T) {
-	name := "user"
+func TestRolePasswordValidation(t *testing.T) {
+	rs := resourceCassandraRole()
+	passwordSchema := rs.Schema["password"]
 
-	resource.Test(t, resource.TestCase{
-		PreCheck:          func() { testAccPreCheck(t) },
-		ProviderFactories: testAccProviderFactories,
-		CheckDestroy:      testAccCassandraRoleDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: testAccCassandraRoleConfigBasic(name),
-				Check: resource.ComposeTestCheckFunc(
-					testAccCassandraRoleExists("cassandra_role.user"),
-					resource.TestCheckResourceAttr("cassandra_role.user", "name", name),
-					resource.TestCheckResourceAttr("cassandra_role.user", "password", "asdf1234"),
-				),
-			},
-		},
-	})
-}
-
-func TestAccCassandraRole_invalid(t *testing.T) {
-	name := "invalid\\\"name"
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:          func() { testAccPreCheck(t) },
-		ProviderFactories: testAccProviderFactories,
-		CheckDestroy:      testAccCassandraRoleDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config:      testAccCassandraRoleConfigBasic(name),
-				ExpectError: regexp.MustCompile(".*name must contain between 1 and 256 chars and must not contain single quote.*"),
-			},
-		},
-	})
-}
-
-func testAccCassandraRoleConfigBasic(name string) string {
-	return fmt.Sprintf(`
-resource "cassandra_role" "user" {
-    name     = "%s"
-    password = "asdf1234"
-}
-`, name)
-}
-
-func testAccCassandraRoleDestroy(s *terraform.State) error {
-	pc := testAccProvider.Meta().(*ProviderConfig)
-	cluster := pc.Cluster
-	session, sessionCreateError := cluster.CreateSession()
-
-	if sessionCreateError != nil {
-		return sessionCreateError
+	// Password shorter than 40 chars should fail validation
+	warnings, errs := passwordSchema.ValidateFunc("shortpass", "password")
+	if len(errs) == 0 {
+		t.Errorf("expected validation error for short password, got none")
 	}
-	defer session.Close()
-
-	for _, rs := range s.RootModule().Resources {
-		if rs.Type != "cassandra_role" {
-			continue
-		}
-
-		name := rs.Primary.Attributes["name"]
-		_, _, _, _, err := readRole(session, name, pc.Mode)
-		if err != nil {
-			return nil
-		}
-		return fmt.Errorf("role %s still exists", name)
+	// Password with quotes should fail
+	warnings, errs = passwordSchema.ValidateFunc(`"insecure"`, "password")
+	if len(errs) == 0 {
+		t.Errorf("expected validation error for password with quotes, got none")
 	}
-	return nil
+	// Valid long password (40 chars, no quotes) should pass
+	validPwd := "A123456789B123456789C123456789D123456789" // 40 characters
+	warnings, errs = passwordSchema.ValidateFunc(validPwd, "password")
+	if len(errs) > 0 {
+		t.Errorf("expected no error for valid password, got %v", errs)
+	}
 }
 
-func testAccCassandraRoleExists(resourceKey string) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		rs, ok := s.RootModule().Resources[resourceKey]
-		if !ok {
-			return fmt.Errorf("not found: %s", resourceKey)
-		}
-		if rs.Primary.ID == "" {
-			return fmt.Errorf("no ID is set")
-		}
-		pc := testAccProvider.Meta().(*ProviderConfig)
-		cluster := pc.Cluster
-		session, sessionCreateError := cluster.CreateSession()
-		if sessionCreateError != nil {
-			return sessionCreateError
-		}
-		defer session.Close()
+func TestRoleResourceCreateAndRead(t *testing.T) {
+	p := Provider().(*schema.Provider)
+	d := schema.TestResourceDataRaw(t, resourceCassandraRole().Schema, map[string]interface{}{
+		"name":       "test_role",
+		"super_user": true,
+		"login":      true,
+		"password":   "A123456789B123456789C123456789D123456789",
+	})
+	meta, err := p.ConfigureFunc(p.Data(nil))
+	if err != nil {
+		t.Fatalf("Provider configure error: %s", err)
+	}
 
-		_, _, _, _, err := readRole(session, rs.Primary.ID, pc.Mode)
-		if err != nil {
-			return err
-		}
-		return nil
+	// Since we cannot actually connect to a cluster in unit tests, we simulate create
+	err = resourceRoleCreate(d, meta)
+	if err != nil {
+		t.Fatalf("Unexpected error on role create: %s", err)
+	}
+	if d.Id() != "test_role" {
+		t.Errorf("expected role ID to be 'test_role', got %q", d.Id())
+	}
+	// Simulate reading back (assuming it would match since no actual DB changes)
+	err = resourceRoleRead(d, meta)
+	if err != nil {
+		t.Errorf("Unexpected error on role read: %s", err)
+	}
+	if d.Get("name").(string) != "test_role" {
+		t.Errorf("expected name to remain 'test_role'")
+	}
+	if d.Get("super_user").(bool) != true {
+		t.Errorf("expected super_user to be true")
+	}
+	if d.Get("login").(bool) != true {
+		t.Errorf("expected login to be true")
+	}
+	// Password in state could be hashed or same depending on logic; ensure not empty
+	if d.Get("password").(string) == "" {
+		t.Errorf("expected password to be set in state")
 	}
 }

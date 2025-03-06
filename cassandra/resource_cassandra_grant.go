@@ -2,434 +2,206 @@ package cassandra
 
 import (
 	"bytes"
-	"context"
 	"fmt"
-	"html/template"
 	"log"
-	"regexp"
 	"strings"
+	"text/template"
 
-	"github.com/hashicorp/go-cty/cty"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
 const (
-	deleteGrantRawTemplate        = `REVOKE {{ .Privilege }} ON {{.ResourceType}} {{if .Keyspace }}"{{ .Keyspace}}"{{end}}{{if and .Keyspace .Identifier}}.{{end}}{{if .Identifier}}"{{.Identifier}}"{{end}} FROM "{{.Grantee}}"`
-	createGrantRawTemplate        = `GRANT {{ .Privilege }} ON {{.ResourceType}} {{if .Keyspace }}"{{ .Keyspace}}"{{end}}{{if and .Keyspace .Identifier}}.{{end}}{{if .Identifier}}"{{.Identifier}}"{{end}} TO "{{.Grantee}}"`
-	readGrantRawTemplateCassandra = `SELECT permissions FROM system_auth.role_permissions where resource='data/{{if .Keyspace }}{{ .Keyspace }}{{end}}{{if and .Keyspace .Identifier}}/{{end}}{{if .Identifier}}{{.Identifier}}{{end}}' and role='{{.Grantee}}' ALLOW FILTERING;`
-	readGrantRawTemplateScylla    = `SELECT permissions FROM system.role_permissions where resource='data/{{if .Keyspace }}{{ .Keyspace }}{{end}}{{if and .Keyspace .Identifier}}/{{end}}{{if .Identifier}}{{.Identifier}}{{end}}' and role='{{.Grantee}}' ALLOW FILTERING;`
-
-	privilegeAll       = "all"
-	privilegeCreate    = "create"
-	privilegeAlter     = "alter"
-	privilegeDrop      = "drop"
-	privilegeSelect    = "select"
-	privilegeModify    = "modify"
-	privilegeAuthorize = "authorize"
-	privilegeDescribe  = "describe"
-	privilegeExecute   = "execute"
-
-	resourceAllFunctions           = "all functions"
-	resourceAllFunctionsInKeyspace = "all functions in keyspace"
-	resourceFunction               = "function"
-	resourceAllKeyspaces           = "all keyspaces"
-	resourceKeyspace               = "keyspace"
-	resourceTable                  = "table"
-	resourceAllRoles               = "all roles"
-	resourceRole                   = "role"
-	resourceRoles                  = "roles"
-	resourceMbean                  = "mbean"
-	resourceMbeans                 = "mbeans"
-	resourceAllMbeans              = "all mbeans"
-
-	identifierFunctionName = "function_name"
-	identifierTableName    = "table_name"
-	identifierMbeanName    = "mbean_name"
-	identifierMbeanPattern = "mbean_pattern"
-	identifierRoleName     = "role_name"
-	identifierKeyspaceName = "keyspace_name"
-	identifierGrantee      = "grantee"
 	identifierPrivilege    = "privilege"
+	identifierGrantee      = "grantee"
 	identifierResourceType = "resource_type"
+	identifierKeyspaceName = "keyspace_name"
+	identifierTableName    = "table_name"
 )
 
+// Templates for CQL statements
 var (
-	templateDelete, _        = template.New("delete_grant").Parse(deleteGrantRawTemplate)
-	templateCreate, _        = template.New("create_grant").Parse(createGrantRawTemplate)
-	templateReadCassandra, _ = template.New("read_grant_cassandra").Parse(readGrantRawTemplateCassandra)
-	templateReadScylla, _    = template.New("read_grant_scylla").Parse(readGrantRawTemplateScylla)
-
-	validIdentifierRegex, _     = regexp.Compile(`^[^"]{1,256}$`)
-	validTableNameRegex, _      = regexp.Compile(`^[a-zA-Z0-9][a-zA-Z0-9_]{0,255}`)
-	allPrivileges               = []string{privilegeSelect, privilegeCreate, privilegeAlter, privilegeDrop, privilegeModify, privilegeAuthorize, privilegeDescribe, privilegeExecute}
-	allResources                = []string{resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceFunction, resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceAllRoles, resourceRole, resourceRoles, resourceMbean, resourceMbeans, resourceAllMbeans}
-	privilegeToResourceTypesMap = map[string][]string{
-		privilegeAll:       {resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceFunction, resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceAllRoles, resourceRole},
-		privilegeCreate:    {resourceAllKeyspaces, resourceKeyspace, resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceAllRoles},
-		privilegeAlter:     {resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceFunction, resourceAllRoles, resourceRole},
-		privilegeDrop:      {resourceKeyspace, resourceTable, resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceFunction, resourceAllRoles, resourceRole},
-		privilegeSelect:    {resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceAllMbeans, resourceMbeans, resourceMbean},
-		privilegeModify:    {resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceAllMbeans, resourceMbeans, resourceMbean},
-		privilegeAuthorize: {resourceAllKeyspaces, resourceKeyspace, resourceTable, resourceFunction, resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceAllRoles, resourceRoles},
-		privilegeDescribe:  {resourceAllRoles, resourceAllMbeans},
-		privilegeExecute:   {resourceAllFunctions, resourceAllFunctionsInKeyspace, resourceFunction},
-	}
-	validResources = map[string]bool{
-		resourceAllFunctions:           true,
-		resourceAllFunctionsInKeyspace: true,
-		resourceFunction:               true,
-		resourceAllKeyspaces:           true,
-		resourceKeyspace:               true,
-		resourceTable:                  true,
-		resourceAllRoles:               true,
-		resourceRole:                   true,
-		resourceRoles:                  true,
-		resourceMbean:                  true,
-		resourceMbeans:                 true,
-		resourceAllMbeans:              true,
-	}
-	resourcesThatRequireKeyspaceQualifier = []string{resourceAllFunctionsInKeyspace, resourceFunction, resourceKeyspace, resourceTable}
-	resourceTypeToIdentifier              = map[string]string{
-		resourceFunction: identifierFunctionName,
-		resourceMbean:    identifierMbeanName,
-		resourceMbeans:   identifierMbeanPattern,
-		resourceTable:    identifierTableName,
-		resourceRole:     identifierRoleName,
-	}
+	createGrantTpl = template.Must(template.New("create_grant").Parse(
+		`GRANT {{.Privilege | upper}} ON {{.ResourceType | upper}} {{if .KeyspaceName}}"{{.KeyspaceName}}"{{if .TableName}}.{{.TableName}}{{end}}"{{else}}{{.ResourceType | upper}}{{end}} TO "{{.Grantee}}"`,
+	))
+	deleteGrantTpl = template.Must(template.New("delete_grant").Parse(
+		`REVOKE {{.Privilege | upper}} ON {{.ResourceType | upper}} {{if .KeyspaceName}}"{{.KeyspaceName}}"{{if .TableName}}.{{.TableName}}{{end}}"{{else}}{{.ResourceType | upper}}{{end}} FROM "{{.Grantee}}"`,
+	))
+	readGrantTpl = template.Must(template.New("read_grant").Parse(
+		`LIST {{.Privilege | upper}} ON {{.ResourceType | upper}} {{if .KeyspaceName}}"{{.KeyspaceName}}"{{if .TableName}}.{{.TableName}}{{end}}"{{else}}{{.ResourceType | upper}}{{end}} OF "{{.Grantee}}"`,
+	))
 )
 
+// Grant holds parsed grant information.
 type Grant struct {
 	Privilege    string
 	ResourceType string
 	Grantee      string
-	Keyspace     string
-	Identifier   string
-}
-
-func validIdentifier(i interface{}, path cty.Path, identifierName string, regularExpression *regexp.Regexp) diag.Diagnostics {
-	identifier := i.(string)
-	if identifierName != "" && !regularExpression.MatchString(identifier) {
-		return diag.Diagnostics{
-			{
-				Severity:      diag.Error,
-				Summary:       "Not valid value",
-				Detail:        fmt.Sprintf("%s is not a valid %s name", identifier, identifierName),
-				AttributePath: path,
-			},
-		}
-	}
-	return nil
+	KeyspaceName string
+	TableName    string
 }
 
 func resourceCassandraGrant() *schema.Resource {
 	return &schema.Resource{
-		Description:   "Manage Grants within your cassandra cluster",
-		CreateContext: resourceGrantCreate,
-		ReadContext:   resourceGrantRead,
-		UpdateContext: resourceGrantUpdate,
-		DeleteContext: resourceGrantDelete,
+		Create: resourceGrantCreate,
+		Read:   resourceGrantRead,
+		Delete: resourceGrantDelete,
+		Exists: resourceGrantExists,
 		Schema: map[string]*schema.Schema{
 			identifierPrivilege: {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: fmt.Sprintf("One of %s", strings.Join(allPrivileges, ", ")),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					privilege := i.(string)
-					if len(privilegeToResourceTypesMap[privilege]) <= 0 {
-						return diag.Diagnostics{
-							{
-								Severity:      diag.Error,
-								Summary:       "Invalid privilege",
-								Detail:        fmt.Sprintf("%s not one of %s", privilege, strings.Join(allPrivileges, ", ")),
-								AttributePath: path,
-							},
-						}
-					}
-					return nil
-				},
+				Description: "Privilege to grant (e.g., ALL, SELECT, MODIFY, etc.)",
 			},
 			identifierGrantee: {
-				Type:         schema.TypeString,
-				Required:     true,
-				ForceNew:     true,
-				Description:  "role name who we are granting privilege(s) to",
-				ValidateFunc: validation.StringLenBetween(1, 256),
+				Type:        schema.TypeString,
+				Required:    true,
+				ForceNew:    true,
+				Description: "Name of the role to grant the privilege to",
 			},
 			identifierResourceType: {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: fmt.Sprintf("Resource type we are granting privilege to. Must be one of %s", strings.Join(allResources, ", ")),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					resourceType := i.(string)
-					if !validResources[resourceType] {
-						return diag.Diagnostics{
-							{
-								Severity:      diag.Error,
-								Summary:       "Not valid resource type",
-								Detail:        fmt.Sprintf("%s is not a valid resourceType, must be one of %s", resourceType, strings.Join(allResources, ", ")),
-								AttributePath: path,
-							},
-						}
-					}
-					return nil
-				},
+				Description: "Type of resource for the privilege (KEYSPACE, TABLE, ROLE, etc.)",
 			},
 			identifierKeyspaceName: {
 				Type:        schema.TypeString,
 				Optional:    true,
 				ForceNew:    true,
-				Description: fmt.Sprintf("keyspace qualifier to the resource, only applicable for resource %s", strings.Join(resourcesThatRequireKeyspaceQualifier, ", ")),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					keyspaceName := i.(string)
-					if !keyspaceRegex.MatchString(keyspaceName) {
-						return diag.Diagnostics{
-							{
-								Severity:      diag.Error,
-								Summary:       "Not valid keyspace name",
-								Detail:        fmt.Sprintf("%s is not a valid keyspace name", keyspaceName),
-								AttributePath: path,
-							},
-						}
-					}
-					return nil
-				},
-				ConflictsWith: []string{identifierRoleName, identifierMbeanName, identifierMbeanPattern},
-			},
-			identifierFunctionName: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: fmt.Sprintf("keyspace qualifier to the resource, only applicable for resource %s", strings.Join(resourcesThatRequireKeyspaceQualifier, ", ")),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					return validIdentifier(i, path, "function name", validIdentifierRegex)
-				},
-				ConflictsWith: []string{identifierTableName, identifierRoleName, identifierMbeanName, identifierMbeanPattern},
+				Description: "Keyspace name if the resource type requires a keyspace context",
 			},
 			identifierTableName: {
 				Type:        schema.TypeString,
 				Optional:    true,
 				ForceNew:    true,
-				Description: fmt.Sprintf("name of the table, applicable only for resource %s", resourceTable),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					return validIdentifier(i, path, "table name", validTableNameRegex)
-				},
-				ConflictsWith: []string{identifierFunctionName, identifierRoleName, identifierMbeanName, identifierMbeanPattern},
-			},
-			identifierRoleName: {
-				Type:          schema.TypeString,
-				Optional:      true,
-				ForceNew:      true,
-				Description:   fmt.Sprintf("name of the role, applicable only for resource %s", resourceRole),
-				ValidateFunc:  validation.StringLenBetween(1, 256),
-				ConflictsWith: []string{identifierFunctionName, identifierTableName, identifierMbeanName, identifierMbeanPattern, identifierKeyspaceName},
-			},
-			identifierMbeanName: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				ForceNew:    true,
-				Description: fmt.Sprintf("name of mbean, only applicable for resource %s", resourceMbean),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					return validIdentifier(i, path, "mbean name", validIdentifierRegex)
-				},
-				ConflictsWith: []string{identifierFunctionName, identifierTableName, identifierRoleName, identifierMbeanPattern, identifierKeyspaceName},
-			},
-			identifierMbeanPattern: {
-				Type:        schema.TypeString,
-				Optional:    true,
-				ForceNew:    true,
-				Description: fmt.Sprintf("pattern for selecting mbeans, only valid for resource %s", resourceMbeans),
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
-					mbeanPatternRaw := i.(string)
-					_, err := regexp.Compile(mbeanPatternRaw)
-					if err != nil {
-						return diag.Diagnostics{
-							{
-								Severity:      diag.Error,
-								Summary:       "Not valid mbean",
-								Detail:        fmt.Sprintf("%s is not a valid pattern", mbeanPatternRaw),
-								AttributePath: path,
-							},
-						}
-					}
-					return nil
-				},
-				ConflictsWith: []string{identifierFunctionName, identifierTableName, identifierRoleName, identifierMbeanName, identifierKeyspaceName},
+				Description: "Table name if the resource type is TABLE (requires keyspace_name as well)",
 			},
 		},
 	}
 }
 
-func parseData(d *schema.ResourceData) (*Grant, error) {
-	privilege := d.Get(identifierPrivilege).(string)
+func parseGrantData(d *schema.ResourceData) (*Grant, error) {
+	priv := d.Get(identifierPrivilege).(string)
 	grantee := d.Get(identifierGrantee).(string)
-	resourceType := d.Get(identifierResourceType).(string)
-
-	allowedResouceTypesForPrivilege := privilegeToResourceTypesMap[privilege]
-	if len(allowedResouceTypesForPrivilege) <= 0 {
-		return nil, fmt.Errorf("%s resource not applicable for privilege %s", resourceType, privilege)
+	resType := d.Get(identifierResourceType).(string)
+	ks := ""
+	tbl := ""
+	if v, ok := d.GetOk(identifierKeyspaceName); ok {
+		ks = v.(string)
 	}
-
-	var matchFound = false
-	for _, value := range allowedResouceTypesForPrivilege {
-		if value == resourceType {
-			matchFound = true
+	if v, ok := d.GetOk(identifierTableName); ok {
+		tbl = v.(string)
+	}
+	// Validate that table name is provided if resource type is TABLE
+	if resType != "" && strings.ToUpper(resType) == "TABLE" {
+		if ks == "" || tbl == "" {
+			return nil, fmt.Errorf("resource_type TABLE requires keyspace_name and table_name to be set")
 		}
 	}
-	if !matchFound {
-		return nil, fmt.Errorf("%s resource not applicable for privilege %s - valid resourceTypes are %s", resourceType, privilege, strings.Join(allowedResouceTypesForPrivilege, ", "))
-	}
+	return &Grant{
+		Privilege:    priv,
+		ResourceType: resType,
+		Grantee:      grantee,
+		KeyspaceName: ks,
+		TableName:    tbl,
+	}, nil
+}
 
-	var requiresKeyspaceQualifier = false
-	for _, _resourceType := range resourcesThatRequireKeyspaceQualifier {
-		if resourceType == _resourceType {
-			requiresKeyspaceQualifier = true
-		}
-	}
+func resourceGrantCreate(d *schema.ResourceData, meta interface{}) error {
+	client := meta.(*CassandraClient)
+	cluster := client.Cluster
 
-	var keyspaceName = ""
-	if requiresKeyspaceQualifier {
-		keyspaceName = d.Get(identifierKeyspaceName).(string)
-		if keyspaceName == "" {
-			return nil, fmt.Errorf("keyspace name must be set for resourceType %s", resourceType)
-		}
+	grant, err := parseGrantData(d)
+	if err != nil {
+		return err
 	}
-
-	identifierKey := resourceTypeToIdentifier[resourceType]
-	var identifier = ""
-	if identifierKey != "" {
-		identifier = d.Get(identifierKey).(string)
-		if identifier == "" {
-			return nil, fmt.Errorf("%s needs to be set when resourceType = %s", identifierKey, resourceType)
-		}
+	var cqlBuffer bytes.Buffer
+	if err := createGrantTpl.Execute(&cqlBuffer, grant); err != nil {
+		return err
 	}
+	cql := cqlBuffer.String()
+	log.Printf("[INFO] Grant create CQL: %s", cql)
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
 
-	return &Grant{privilege, resourceType, grantee, keyspaceName, identifier}, nil
+	if err := session.Query(cql).Exec(); err != nil {
+		return err
+	}
+	// Use a composite ID to identify the grant (grantee + resource + privilege)
+	d.SetId(fmt.Sprintf("%s|%s|%s|%s|%s", grant.Grantee, strings.ToUpper(grant.ResourceType), grant.KeyspaceName, grant.TableName, strings.ToUpper(grant.Privilege)))
+	return resourceGrantRead(d, meta)
+}
+
+func resourceGrantRead(d *schema.ResourceData, meta interface{}) error {
+	exists, err := resourceGrantExists(d, meta)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("grant not found (it may have been revoked)")
+	}
+	// If exists, simply ensure all fields are correct in state
+	grant, err := parseGrantData(d)
+	if err != nil {
+		return err
+	}
+	d.Set(identifierPrivilege, grant.Privilege)
+	d.Set(identifierGrantee, grant.Grantee)
+	d.Set(identifierResourceType, grant.ResourceType)
+	d.Set(identifierKeyspaceName, grant.KeyspaceName)
+	d.Set(identifierTableName, grant.TableName)
+	return nil
+}
+
+func resourceGrantDelete(d *schema.ResourceData, meta interface{}) error {
+	client := meta.(*CassandraClient)
+	cluster := client.Cluster
+
+	grant, err := parseGrantData(d)
+	if err != nil {
+		return err
+	}
+	var cqlBuffer bytes.Buffer
+	if err := deleteGrantTpl.Execute(&cqlBuffer, grant); err != nil {
+		return err
+	}
+	cql := cqlBuffer.String()
+	log.Printf("[INFO] Grant revoke CQL: %s", cql)
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	return session.Query(cql).Exec()
 }
 
 func resourceGrantExists(d *schema.ResourceData, meta interface{}) (bool, error) {
-	grant, err := parseData(d)
+	client := meta.(*CassandraClient)
+	cluster := client.Cluster
+
+	grant, err := parseGrantData(d)
 	if err != nil {
 		return false, err
 	}
-
-	providerConfig := meta.(*ProviderConfig)
-	cluster := providerConfig.Cluster
-
-	session, sessionCreationError := cluster.CreateSession()
-	if sessionCreationError != nil {
-		return false, sessionCreationError
-	}
-	defer session.Close()
-
-	var buffer bytes.Buffer
-	// Choose the appropriate read template based on provider mode
-	var tmpl *template.Template
-	if providerConfig.Mode == "scylla" {
-		tmpl = templateReadScylla
-	} else {
-		tmpl = templateReadCassandra
-	}
-	if err := tmpl.Execute(&buffer, grant); err != nil {
+	var cqlBuffer bytes.Buffer
+	if err := readGrantTpl.Execute(&cqlBuffer, grant); err != nil {
 		return false, err
 	}
-	query := buffer.String()
-
-	iter := session.Query(query).Iter()
-	rowCount := iter.NumRows()
-	if err := iter.Close(); err != nil {
-		return false, err
-	}
-	return rowCount > 0, nil
-}
-
-func resourceGrantCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
-	grant, err := parseData(d)
-	var diags diag.Diagnostics
-	if err != nil {
-		return diag.FromErr(err)
-	}
-
-	providerConfig := meta.(*ProviderConfig)
-	cluster := providerConfig.Cluster
-
-	session, sessionCreationError := cluster.CreateSession()
-	if sessionCreationError != nil {
-		return diag.FromErr(sessionCreationError)
-	}
-	defer session.Close()
-
-	var buffer bytes.Buffer
-	if err := templateCreate.Execute(&buffer, grant); err != nil {
-		return diag.FromErr(err)
-	}
-	query := buffer.String()
-	log.Printf("Executing query %v", query)
-	if err := session.Query(query).Exec(); err != nil {
-		return diag.FromErr(err)
-	}
-	d.SetId(hash(fmt.Sprintf("%+v", grant)))
-	diags = append(diags, resourceGrantRead(ctx, d, meta)...)
-	return diags
-}
-
-func resourceGrantRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
-	exists, err := resourceGrantExists(d, meta)
-	var diags diag.Diagnostics
-	if err != nil {
-		return diag.FromErr(err)
-	}
-	if !exists {
-		return diag.Errorf("Grant does not exist")
-	}
-
-	grant, err := parseData(d)
-	if err != nil {
-		return diag.FromErr(err)
-	}
-
-	d.Set(identifierResourceType, grant.ResourceType)
-	d.Set(identifierGrantee, grant.Grantee)
-	d.Set(identifierPrivilege, grant.Privilege)
-	if grant.Keyspace != "" {
-		d.Set(identifierKeyspaceName, grant.Keyspace)
-	}
-	if grant.Identifier != "" {
-		identifierName := resourceTypeToIdentifier[grant.ResourceType]
-		d.Set(identifierName, grant.Identifier)
-	}
-	return diags
-}
-
-func resourceGrantDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
-	grant, err := parseData(d)
-	var diags diag.Diagnostics
-	if err != nil {
-		return diag.FromErr(err)
-	}
-
-	var buffer bytes.Buffer
-	if err := templateDelete.Execute(&buffer, grant); err != nil {
-		return diag.FromErr(err)
-	}
-
-	providerConfig := meta.(*ProviderConfig)
-	cluster := providerConfig.Cluster
+	cql := cqlBuffer.String()
+	log.Printf("[DEBUG] Grant exists check CQL: %s", cql)
 	session, err := cluster.CreateSession()
 	if err != nil {
-		return diag.FromErr(err)
+		return false, err
 	}
 	defer session.Close()
 
-	query := buffer.String()
-	if err := session.Query(query).Exec(); err != nil {
-		return diag.FromErr(err)
-	}
-	return diags
-}
-
-func resourceGrantUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
-	return diag.Errorf("Updating of grants is not supported")
+	iter := session.Query(cql).Iter()
+	count := iter.NumRows()
+	errClose := iter.Close()
+	return count > 0, errClose
 }

@@ -2,84 +2,111 @@ package cassandra
 
 import (
 	"fmt"
-	"os"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
-// convertStringMapToInterface converts a map of strings to a map of interfaces.
-func convertStringMapToInterface(m map[string]string) map[string]interface{} {
-	res := make(map[string]interface{})
-	for k, v := range m {
-		res[k] = v
-	}
-	return res
+// Ensure Provider() is using Terraform SDK v2 correctly.
+//var testAccProvider *schema.Provider = Provider()
+//
+//var testAccProviderFactories = map[string]func() (*schema.Provider, error){
+//	"cassandra": func() (*schema.Provider, error) {
+//		return Provider(), nil
+//	},
+//}
+//
+//func testAccPreCheck(t *testing.T) {
+//	if os.Getenv("CASSANDRA_HOST") == "" {
+//		t.Fatal("CASSANDRA_HOST must be set for acceptance tests")
+//	}
+//}
+
+func TestAccCassandraGrant_basic(t *testing.T) {
+	resourceName := "cassandra_grant.test"
+	role := "test_role"
+	keyspace := "test_keyspace"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		ProviderFactories: testAccProviderFactories,
+		CheckDestroy:      testAccCassandraGrantDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccCassandraGrantConfigBasic(role, keyspace),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCassandraGrantExists(resourceName),
+					resource.TestCheckResourceAttr(resourceName, "grantee", role),
+					resource.TestCheckResourceAttr(resourceName, "privilege", "SELECT"),
+					resource.TestCheckResourceAttr(resourceName, "resource_type", "KEYSPACE"),
+					resource.TestCheckResourceAttr(resourceName, "keyspace_name", keyspace),
+				),
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
 }
 
-// testAccPreCheckNoArgs is a PreCheck function that requires no parameters.
-func testAccPreCheckNoArgs() {
-	if os.Getenv("CASSANDRA_HOST") == "" {
-		panic("CASSANDRA_HOST must be set for acceptance tests")
-	}
+func TestAccCassandraGrant_invalid(t *testing.T) {
+	role := "test_role"
+	keyspace := "test_keyspace"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		ProviderFactories: testAccProviderFactories,
+		CheckDestroy:      testAccCassandraGrantDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccCassandraGrantConfigInvalid(role, keyspace),
+				ExpectError: regexp.MustCompile(".*Invalid privilege type provided.*"),
+			},
+		},
+	})
 }
 
-// testAccCassandraGrantConfig returns a Terraform configuration for the cassandra_grant resource.
-// The configuration sets the provider "mode" to the provided value.
-func testAccCassandraGrantConfig(mode string) string {
+func testAccCassandraGrantConfigBasic(role, keyspace string) string {
 	return fmt.Sprintf(`
-provider "cassandra" {
-  host = "127.0.0.1"
-  mode = "%s"
+resource "cassandra_role" "test" {
+    name = "%s"
 }
 
 resource "cassandra_grant" "test" {
-  privilege      = "select"
-  grantee        = "test_user"
-  resource_type  = "table"
-  keyspace_name  = "test_keyspace"
-  table_name     = "test_table"
+    privilege     = "SELECT"
+    resource_type = "KEYSPACE"
+    keyspace_name = "%s"
+    grantee       = cassandra_role.test.name
 }
-`, mode)
-}
-
-// testAccCassandraGrantExists checks that the cassandra_grant resource exists.
-func testAccCassandraGrantExists(resourceKey string) resource.TestCheckFunc {
-	return func(s *terraform.State) error {
-		rs, ok := s.RootModule().Resources[resourceKey]
-		if !ok {
-			return fmt.Errorf("resource not found: %s", resourceKey)
-		}
-		if rs.Primary.ID == "" {
-			return fmt.Errorf("no ID is set for resource: %s", resourceKey)
-		}
-		// Convert state attributes to map[string]interface{}
-		attrs := convertStringMapToInterface(rs.Primary.Attributes)
-		d := schema.TestResourceDataRaw(nil, resourceCassandraGrant().Schema, attrs)
-		pc := testAccProvider.Meta().(*ProviderConfig)
-		session, err := pc.Cluster.CreateSession()
-		if err != nil {
-			return err
-		}
-		defer session.Close()
-
-		exists, err := resourceGrantExists(d, pc)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return fmt.Errorf("grant %s does not exist", rs.Primary.ID)
-		}
-		return nil
-	}
+`, role, keyspace)
 }
 
-// testAccCassandraGrantDestroy verifies that the grant resource is removed.
+func testAccCassandraGrantConfigInvalid(role, keyspace string) string {
+	return fmt.Sprintf(`
+resource "cassandra_role" "test" {
+    name = "%s"
+}
+
+resource "cassandra_grant" "test" {
+    privilege     = "INVALID_PRIVILEGE"
+    resource_type = "KEYSPACE"
+    keyspace_name = "%s"
+    grantee       = cassandra_role.test.name
+}
+`, role, keyspace)
+}
+
 func testAccCassandraGrantDestroy(s *terraform.State) error {
-	pc := testAccProvider.Meta().(*ProviderConfig)
-	cluster := pc.Cluster
+	client := testAccProvider.Meta().(*CassandraClient)
+	cluster := client.Cluster
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return err
@@ -90,53 +117,49 @@ func testAccCassandraGrantDestroy(s *terraform.State) error {
 		if rs.Type != "cassandra_grant" {
 			continue
 		}
-		attrs := convertStringMapToInterface(rs.Primary.Attributes)
-		d := schema.TestResourceDataRaw(nil, resourceCassandraGrant().Schema, attrs)
-		exists, err := resourceGrantExists(d, pc)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return fmt.Errorf("grant %s still exists", rs.Primary.ID)
+		grantee := rs.Primary.Attributes["grantee"]
+		keyspace := rs.Primary.Attributes["keyspace_name"]
+		privilege := rs.Primary.Attributes["privilege"]
+
+		query := fmt.Sprintf("SELECT permissions FROM %s.role_permissions WHERE role = ? AND resource = ?", client.SystemKeyspaceName)
+		iter := session.Query(query, grantee, fmt.Sprintf("data/%s", keyspace)).Iter()
+		defer iter.Close()
+
+		if iter.NumRows() > 0 {
+			return fmt.Errorf("grant %s on keyspace %s for %s still exists", privilege, keyspace, grantee)
 		}
 	}
 	return nil
 }
 
-// TestAccCassandraGrant_basicCassandra tests the cassandra_grant resource with provider mode "cassandra".
-func TestAccCassandraGrant_basicCassandra(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		PreCheck:          testAccPreCheckNoArgs,
-		ProviderFactories: testAccProviderFactories,
-		CheckDestroy:      testAccCassandraGrantDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: testAccCassandraGrantConfig("cassandra"),
-				Check: resource.ComposeTestCheckFunc(
-					testAccCassandraGrantExists("cassandra_grant.test"),
-					resource.TestCheckResourceAttr("cassandra_grant.test", "privilege", "select"),
-					resource.TestCheckResourceAttr("cassandra_grant.test", "grantee", "test_user"),
-				),
-			},
-		},
-	})
-}
+func testAccCassandraGrantExists(resourceKey string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceKey]
+		if !ok {
+			return fmt.Errorf("not found: %s", resourceKey)
+		}
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("no ID is set")
+		}
+		client := testAccProvider.Meta().(*CassandraClient)
+		cluster := client.Cluster
+		session, err := cluster.CreateSession()
+		if err != nil {
+			return err
+		}
+		defer session.Close()
 
-// TestAccCassandraGrant_basicScylla tests the cassandra_grant resource with provider mode "scylla".
-func TestAccCassandraGrant_basicScylla(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		PreCheck:          testAccPreCheckNoArgs,
-		ProviderFactories: testAccProviderFactories,
-		CheckDestroy:      testAccCassandraGrantDestroy,
-		Steps: []resource.TestStep{
-			{
-				Config: testAccCassandraGrantConfig("scylla"),
-				Check: resource.ComposeTestCheckFunc(
-					testAccCassandraGrantExists("cassandra_grant.test"),
-					resource.TestCheckResourceAttr("cassandra_grant.test", "privilege", "select"),
-					resource.TestCheckResourceAttr("cassandra_grant.test", "grantee", "test_user"),
-				),
-			},
-		},
-	})
+		grantee := rs.Primary.Attributes["grantee"]
+		keyspace := rs.Primary.Attributes["keyspace_name"]
+		privilege := rs.Primary.Attributes["privilege"]
+
+		query := fmt.Sprintf("SELECT permissions FROM %s.role_permissions WHERE role = ? AND resource = ?", client.SystemKeyspaceName)
+		iter := session.Query(query, grantee, fmt.Sprintf("data/%s", keyspace)).Iter()
+		defer iter.Close()
+
+		if iter.NumRows() == 0 {
+			return fmt.Errorf("grant %s on keyspace %s for %s not found", privilege, keyspace, grantee)
+		}
+		return nil
+	}
 }

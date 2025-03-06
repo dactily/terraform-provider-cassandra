@@ -1,209 +1,152 @@
 package cassandra
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/gocql/gocql"
-	"github.com/hashicorp/go-cty/cty"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
-var (
-	allowedTLSProtocols = map[string]uint16{
-		"TLS1.0": tls.VersionTLS10,
-		"TLS1.1": tls.VersionTLS11,
-		"TLS1.2": tls.VersionTLS12,
-		"TLS1.3": tls.VersionTLS13,
-	}
-
-	allowedConsistencies = map[string]gocql.Consistency{
-		"ANY":          gocql.Any,
-		"ONE":          gocql.One,
-		"TWO":          gocql.Two,
-		"THREE":        gocql.Three,
-		"QUORUM":       gocql.Quorum,
-		"ALL":          gocql.All,
-		"LOCAL_QUORUM": gocql.LocalQuorum,
-		"EACH_QUORUM":  gocql.EachQuorum,
-		"LOCAL_ONE":    gocql.LocalOne,
-	}
-)
-
-// ProviderConfig wraps the underlying gocql.ClusterConfig and holds additional settings.
-type ProviderConfig struct {
-	Cluster *gocql.ClusterConfig
-	Mode    string
+// CassandraClient holds the cluster configuration and settings for system keyspace and password hashing.
+type CassandraClient struct {
+	Cluster               *gocql.ClusterConfig
+	SystemKeyspaceName    string
+	PasswordHashAlgorithm string
 }
 
-// Provider returns a terraform.ResourceProvider
+// Provider returns the Terraform provider configuration for Cassandra/ScyllaDB.
 func Provider() *schema.Provider {
 	return &schema.Provider{
-		ResourcesMap: map[string]*schema.Resource{
-			"cassandra_keyspace": resourceCassandraKeyspace(),
-			"cassandra_role":     resourceCassandraRole(),
-			"cassandra_grant":    resourceCassandraGrant(),
-			"cassandra_table":    resourceCassandraTableSpace(),
-		},
-		ConfigureContextFunc: configureProvider,
 		Schema: map[string]*schema.Schema{
 			"username": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("CASSANDRA_USERNAME", ""),
-				Description: "Cassandra username",
+				Default:     "",
+				Description: "Cassandra username for authentication",
 				Sensitive:   true,
 			},
 			"password": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("CASSANDRA_PASSWORD", ""),
-				Description: "Cassandra password",
+				Default:     "",
+				Description: "Cassandra password for authentication",
 				Sensitive:   true,
 			},
 			"port": {
-				Type:         schema.TypeInt,
-				Optional:     true,
-				DefaultFunc:  schema.EnvDefaultFunc("CASSANDRA_PORT", 9042),
-				Description:  "Cassandra CQL Port",
-				ValidateFunc: validation.IsPortNumber,
-			},
-			"host": {
-				Type:         schema.TypeString,
-				DefaultFunc:  schema.EnvDefaultFunc("CASSANDRA_HOST", nil),
-				Description:  "Cassandra host",
-				Optional:     true,
-				ExactlyOneOf: []string{"host", "hosts"},
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Default:     9042,
+				Description: "Cassandra CQL port (default 9042)",
+				ValidateFunc: func(i interface{}, k string) ([]string, []error) {
+					port := i.(int)
+					if port <= 0 || port >= 65535 {
+						return nil, []error{fmt.Errorf("%d: invalid port - must be between 1 and 65535", port)}
+					}
+					return nil, nil
+				},
 			},
 			"hosts": {
-				Type: schema.TypeList,
-				Elem: &schema.Schema{
-					Type: schema.TypeString,
-				},
+				Type:        schema.TypeList,
+				Elem:        &schema.Schema{Type: schema.TypeString},
 				MinItems:    1,
-				Optional:    true,
-				Description: "Cassandra hosts",
-			},
-			"host_filter": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Default:     false,
-				Description: "Filter all incoming events for host. Hosts have to exist before using this provider",
+				Required:    true,
+				Description: "List of contact point hosts for the Cassandra/Scylla cluster",
 			},
 			"connection_timeout": {
 				Type:        schema.TypeInt,
 				Optional:    true,
 				Default:     1000,
-				Description: "Connection timeout in milliseconds",
+				Description: "Connection timeout to the cluster in milliseconds",
 			},
 			"root_ca": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Description: "Use root CA to connect to Cluster. Applies only when use_ssl is enabled",
-				ValidateDiagFunc: func(i interface{}, path cty.Path) diag.Diagnostics {
+				Description: "PEM-encoded CA certificate for TLS (when use_ssl is true)",
+				ValidateFunc: func(i interface{}, k string) ([]string, []error) {
 					rootCA := i.(string)
 					if rootCA == "" {
-						return nil
+						return nil, nil
 					}
 					caPool := x509.NewCertPool()
-					ok := caPool.AppendCertsFromPEM([]byte(rootCA))
-					if !ok {
-						return diag.Diagnostics{
-							{
-								Severity:      diag.Error,
-								Summary:       "Invalid PEM",
-								Detail:        fmt.Sprintf("%s: invalid PEM", rootCA),
-								AttributePath: path,
-							},
-						}
+					if ok := caPool.AppendCertsFromPEM([]byte(rootCA)); !ok {
+						return nil, []error{fmt.Errorf("invalid PEM data for root_ca")}
 					}
-					return nil
+					return nil, nil
 				},
 			},
 			"use_ssl": {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Default:     false,
-				Description: "Use SSL when connecting to cluster",
+				Description: "Enable SSL/TLS for connection",
 			},
 			"min_tls_version": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				Default:      "TLS1.2",
-				Description:  "Minimum TLS Version used to connect to the cluster - allowed values are TLS1.0, TLS1.1, TLS1.2, TLS1.3. Applies only when use_ssl is enabled",
-				ValidateFunc: validation.StringInSlice([]string{"TLS1.0", "TLS1.1", "TLS1.2", "TLS1.3"}, false),
+				Type:        schema.TypeString,
+				Optional:    true,
+				Default:     "TLS1.2",
+				Description: "Minimum TLS version for SSL connection (TLS1.2 by default)",
 			},
 			"protocol_version": {
 				Type:        schema.TypeInt,
 				Optional:    true,
 				Default:     4,
-				Description: "CQL Binary Protocol Version",
+				Description: "CQL protocol version (default 4)",
 			},
-			"consistency": {
+			"system_keyspace_name": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     gocql.Quorum.String(),
-				Description: "Default consistency level",
+				Default:     "system_auth",
+				Description: "System keyspace storing roles and permissions (\"system_auth\" for Cassandra/older Scylla, \"system\" for newer Scylla)",
 			},
-			"cql_version": {
+			"pw_encryption_algorithm": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "3.0.0",
-				Description: "CQL version",
-			},
-			"keyspace": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: "Initial Keyspace",
-			},
-			"disable_initial_host_lookup": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Description: "Whether the driver will not attempt to get host info from the system.peers table",
-			},
-			// NEW: provider mode option
-			"mode": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				Default:      "cassandra",
-				Description:  "Provider mode: cassandra (default) or scylla",
-				ValidateFunc: validation.StringInSlice([]string{"cassandra", "scylla"}, false),
+				Default:     "bcrypt",
+				Description: "Hash algorithm for storing passwords (\"bcrypt\" for Cassandra/older Scylla, \"sha-512\" for newer Scylla)",
 			},
 		},
+		ResourcesMap: map[string]*schema.Resource{
+			"cassandra_keyspace": resourceCassandraKeyspace(),
+			"cassandra_table":    resourceCassandraTable(),
+			"cassandra_role":     resourceCassandraRole(),
+			"cassandra_grant":    resourceCassandraGrant(),
+		},
+		ConfigureFunc: configureProvider,
 	}
 }
 
-func configureProvider(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-	log.Printf("Creating provider")
+var allowedTLSProtocols = map[string]uint16{
+	"TLS1.0": tls.VersionTLS10,
+	"TLS1.1": tls.VersionTLS11,
+	"TLS1.2": tls.VersionTLS12,
+	"TLS1.3": tls.VersionTLS13,
+}
 
-	useSSL := d.Get("use_ssl").(bool)
+// configureProvider initializes the Cassandra cluster connection and returns a client.
+func configureProvider(d *schema.ResourceData) (interface{}, error) {
+	log.Printf("[INFO] Initializing Cassandra/Scylla provider")
+	// Gather provider settings
+	hostsRaw := d.Get("hosts").([]interface{})
+	hosts := make([]string, 0, len(hostsRaw))
+	for _, h := range hostsRaw {
+		hosts = append(hosts, h.(string))
+		log.Printf("[DEBUG] Using host %s", h.(string))
+	}
+	port := d.Get("port").(int)
 	username := d.Get("username").(string)
 	password := d.Get("password").(string)
-	port := d.Get("port").(int)
+	useSSL := d.Get("use_ssl").(bool)
 	connectionTimeout := d.Get("connection_timeout").(int)
 	protocolVersion := d.Get("protocol_version").(int)
-	diags := diag.Diagnostics{}
+	systemKeyspace := d.Get("system_keyspace_name").(string)
+	pwAlgorithm := d.Get("pw_encryption_algorithm").(string)
 
-	var rawHosts []interface{}
-	if rawHost, ok := d.GetOk("host"); ok {
-		rawHosts = []interface{}{rawHost}
-	} else {
-		rawHosts = d.Get("hosts").([]interface{})
-	}
-
-	hosts := make([]string, 0, len(rawHosts))
-	hostFilter := d.Get("host_filter").(bool)
-	for _, v := range rawHosts {
-		hosts = append(hosts, v.(string))
-		log.Printf("Using host %v", v.(string))
-	}
-
+	// Configure cluster
 	cluster := gocql.NewCluster()
 	cluster.Hosts = hosts
 	cluster.Port = port
@@ -212,53 +155,33 @@ func configureProvider(ctx context.Context, d *schema.ResourceData) (interface{}
 		Password: password,
 	}
 	cluster.ConnectTimeout = time.Millisecond * time.Duration(connectionTimeout)
-	cluster.Timeout = time.Minute * 1
-	cluster.CQLVersion = d.Get("cql_version").(string)
-
-	if v, ok := d.GetOk("keyspace"); ok && v.(string) != "" {
-		cluster.Keyspace = v.(string)
-	}
-
-	cluster.Consistency = allowedConsistencies[d.Get("consistency").(string)]
+	cluster.Timeout = 1 * time.Minute
+	cluster.CQLVersion = "3.0.0"
+	cluster.Keyspace = systemKeyspace
 	cluster.ProtoVersion = protocolVersion
-
-	if hostFilter {
-		cluster.HostFilter = gocql.WhiteListHostFilter(hosts...)
-	}
-
-	if v, ok := d.GetOk("disable_initial_host_lookup"); ok {
-		cluster.DisableInitialHostLookup = v.(bool)
-	}
+	cluster.HostFilter = gocql.WhiteListHostFilter(hosts...)
+	cluster.DisableInitialHostLookup = true
 
 	if useSSL {
 		rootCA := d.Get("root_ca").(string)
-		minTLSVersion := d.Get("min_tls_version").(string)
+		minTLS := d.Get("min_tls_version").(string)
 		tlsConfig := &tls.Config{
-			MinVersion: allowedTLSProtocols[minTLSVersion],
+			MinVersion: allowedTLSProtocols[minTLS],
 		}
 		if rootCA != "" {
 			caPool := x509.NewCertPool()
-			ok := caPool.AppendCertsFromPEM([]byte(rootCA))
-			if !ok {
-				diags = append(diags, diag.Diagnostic{
-					Severity:      diag.Error,
-					Summary:       "Unable to load rootCA",
-					AttributePath: cty.Path{cty.GetAttrStep{Name: "root_ca"}},
-				})
-				return nil, diags
+			if ok := caPool.AppendCertsFromPEM([]byte(rootCA)); !ok {
+				return nil, errors.New("unable to load root CA")
 			}
 			tlsConfig.RootCAs = caPool
 		}
-		cluster.SslOpts = &gocql.SslOptions{
-			Config: tlsConfig,
-		}
+		cluster.SslOpts = &gocql.SslOptions{Config: tlsConfig}
 	}
 
-	mode := d.Get("mode").(string)
-	log.Printf("Using provider mode: %s", mode)
-
-	return &ProviderConfig{
-		Cluster: cluster,
-		Mode:    mode,
-	}, diags
+	log.Printf("[INFO] Cassandra cluster configuration prepared. Hosts: %v, Port: %d, Keyspace: %s, SSL: %v", hosts, port, systemKeyspace, useSSL)
+	return &CassandraClient{
+		Cluster:               cluster,
+		SystemKeyspaceName:    systemKeyspace,
+		PasswordHashAlgorithm: pwAlgorithm,
+	}, nil
 }

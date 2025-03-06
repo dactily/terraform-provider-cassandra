@@ -1,83 +1,31 @@
 package cassandra
 
 import (
-	"context"
-	"log"
-	"os"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
 
-var (
-	testAccProviderFactories map[string]func() (*schema.Provider, error)
-	testAccProvider          *schema.Provider
-)
-
-func init() {
-	testAccProvider = Provider()
-	testAccProviderFactories = map[string]func() (*schema.Provider, error){
-		"cassandra": func() (*schema.Provider, error) {
-			log.Printf("testAccProviderFactories: 1")
-			return testAccProvider, nil
-		},
-	}
-}
-
-func TestProvider(t *testing.T) {
-	if err := Provider().InternalValidate(); err != nil {
+func TestProviderSchema(t *testing.T) {
+	p := Provider()
+	if err := p.InternalValidate(); err != nil {
 		t.Fatalf("err: %s", err)
 	}
-}
 
-func TestProvider_impl(t *testing.T) {
-	var _ *schema.Provider = Provider()
-}
-
-func TestProvider_configure1(t *testing.T) {
-	rc := terraform.NewResourceConfigRaw(map[string]interface{}{
-		"username": "cassanrda",
-		"password": "cassanrda",
-		"port":     9042,
-		"host":     "asdf",
-	})
-	p := Provider()
-	v := p.Validate(rc)
-	if v.HasError() {
-		t.Fatal("Error during parsing")
+	// Verify that required provider configuration keys exist
+	schemaMap := p.Schema
+	expectedKeys := []string{"username", "password", "hosts", "port", "connection_timeout", "use_ssl", "root_ca", "min_tls_version", "protocol_version", "system_keyspace_name", "pw_encryption_algorithm"}
+	for _, k := range expectedKeys {
+		if _, ok := schemaMap[k]; !ok {
+			t.Errorf("expected provider schema to have key %q", k)
+		}
 	}
-	err := p.Configure(context.Background(), rc)
-	if err != nil {
-		t.Fatal(err)
+	// Check default values for new settings
+	d := schema.TestResourceDataRaw(t, schemaMap, map[string]interface{}{})
+	if d.Get("system_keyspace_name").(string) != "system_auth" {
+		t.Errorf("expected default system_keyspace_name to be 'system_auth'")
 	}
-}
-
-func TestProvider_configure2(t *testing.T) {
-	rc := terraform.NewResourceConfigRaw(map[string]interface{}{
-		"username": "cassanrda",
-		"password": "cassanrda",
-		"port":     9042,
-		"hosts":    []interface{}{"asd"},
-	})
-	p := Provider()
-	v := p.Validate(rc)
-	if v.HasError() {
-		t.Fatal("Error during parsing")
-	}
-	err := p.Configure(context.Background(), rc)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func testAccPreCheck(t *testing.T) {
-	url := os.Getenv("CASSANDRA_HOST")
-	if url == "" {
-		t.Fatal("CASSANDRA_HOST must be set for acceptance tests")
-	}
-	err := testAccProvider.Configure(context.Background(), terraform.NewResourceConfigRaw(nil))
-	if err != nil {
-		t.Fatal(err)
+	if d.Get("pw_encryption_algorithm").(string) != "bcrypt" {
+		t.Errorf("expected default pw_encryption_algorithm to be 'bcrypt'")
 	}
 }

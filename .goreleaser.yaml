@@ -55,4 +55,4 @@ changelog:
   disable: true
 
 release:
-  draft: false
+  draft: true
