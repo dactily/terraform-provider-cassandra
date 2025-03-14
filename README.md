@@ -33,4 +33,5 @@ provider "cassandra" {
   # cql_version         = "3.0.0"
   # keyspace            = "initial_keyspace"
   # disable_initial_host_lookup = false
+  # enable_host_verification    = true
 }

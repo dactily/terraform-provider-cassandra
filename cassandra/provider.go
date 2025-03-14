@@ -139,6 +139,12 @@ func Provider() *schema.Provider {
 				Description:  "Minimum TLS Version used to connect to the cluster - allowed values are TLS1.0, TLS1.1, TLS1.2, TLS1.3. Applies only when use_ssl is enabled",
 				ValidateFunc: validation.StringInSlice([]string{"TLS1.0", "TLS1.1", "TLS1.2", "TLS1.3"}, false),
 			},
+			"enable_host_verification": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Option to disable host verification with SSL. Setting this to false is equivalent to setting SSL_VALIDATE=false with cql",
+			},
 			"protocol_version": {
 				Type:        schema.TypeInt,
 				Optional:    true,
@@ -256,6 +262,7 @@ func configureProvider(ctx context.Context, d *schema.ResourceData) (interface{}
 		}
 		cluster.SslOpts = &gocql.SslOptions{
 			Config: tlsConfig,
+			EnableHostVerification: d.Get("enable_host_verification").(bool),
 		}
 	}
 

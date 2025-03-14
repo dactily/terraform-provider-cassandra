@@ -79,6 +79,7 @@ resource "cassandra_keyspace" "keyspace" {
 - `consistency` (String) Default consistency level
 - `cql_version` (String) CQL version
 - `disable_initial_host_lookup` (Boolean) Whether the driver will not attempt to get host info from the system.peers table
+- `enable_host_verification`(Boolean) Whether the driver will use host verification when connecting to the cassandra
 - `host` (String) Cassandra host
 - `host_filter` (Boolean) Filter all incoming events for host. Hosts have to existing before using this provider
 - `hosts` (List of String) Cassandra hosts
